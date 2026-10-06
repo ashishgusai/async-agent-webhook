@@ -1,14 +1,23 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
 import uuid
 
+import db
 # Import our Celery task
 from celery_worker import process_ticket_task
+
+# Initialize SQLite database on API startup
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db.init_db()
+    yield
 
 app = FastAPI(
     title="Async Multi-Agent Webhook",
     description="Processes incoming support tickets using background AI agents.",
-    version="0.2.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 class TicketPayload(BaseModel):
@@ -24,16 +33,24 @@ class WebhookResponse(BaseModel):
 
 @app.post("/webhook/support-ticket", response_model=WebhookResponse, status_code=202)
 async def receive_ticket(payload: TicketPayload):
-    # 1. Convert Pydantic model to a standard dictionary for Celery serialization
-    ticket_dict = payload.model_dump()
+    # Save initial 'processing' state to database
+    db.insert_ticket(payload.ticket_id, payload.customer_name, payload.issue_description)
     
-    # 2. Dispatch to Celery queue immediately
-    # .delay() pushes the job to Redis and returns instantly
-    process_ticket_task.delay(ticket_dict)
+    # Dispatch to Celery worker in the background
+    process_ticket_task.delay(payload.model_dump())
     
-    # 3. Return HTTP 202 to the third-party webhook sender
+    # Return 202 Accepted immediately
     return WebhookResponse(
         message="Webhook received. AI agents are processing the ticket in the background.",
         ticket_id=payload.ticket_id,
         status="queued"
     )
+
+# Endpoint to check the status of a ticket
+@app.get("/api/v1/tickets/{ticket_id}")
+async def get_ticket_status(ticket_id: str):
+    record = db.get_ticket(ticket_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    
+    return dict(record)
